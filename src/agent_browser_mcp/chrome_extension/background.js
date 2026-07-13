@@ -53,6 +53,9 @@ async function handleExtMessage(msg, sender) {
       return { ok: false, error: 'Unknown method: ' + msg.method };
     } catch (e) { return { ok: false, error: e.message }; }
   }
+  if (msg.cmd === 'ws_state') {
+    return { ok: true, connected: !!(ws && ws.readyState === 1) };
+  }
   return { ok: false, error: 'Unknown cmd: ' + msg.cmd };
 }
 

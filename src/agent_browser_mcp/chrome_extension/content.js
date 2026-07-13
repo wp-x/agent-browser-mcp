@@ -8,10 +8,12 @@ document.querySelectorAll('meta[http-equiv="Content-Security-Policy"]').forEach(
   if(window.self!==window.top)return;
   const d=document.createElement('div');
   d.id='ljq-ind';
-  d.innerText='ljq_driver: 已连接';
-  d.style.cssText='position:fixed;bottom:8px;right:8px;background:#4CAF50;color:white;padding:4px 7px;border-radius:4px;font-size:11px;font-weight:bold;z-index:99999;cursor:pointer;box-shadow:0 2px 4px rgba(0,0,0,0.2);opacity:0.5;';
-  d.addEventListener('click',()=>alert('会话活跃\nURL: '+location.href));
+  d.style.cssText='position:fixed;bottom:8px;right:8px;background:#9E9E9E;color:white;padding:4px 7px;border-radius:4px;font-size:11px;font-weight:bold;z-index:99999;cursor:pointer;box-shadow:0 2px 4px rgba(0,0,0,0.2);opacity:0.5;';
+  d.addEventListener('click',()=>alert(d.innerText+'\nURL: '+location.href));
   (document.body||document.documentElement).appendChild(d);
+  const render=ok=>{d.innerText='ljq_driver: '+(ok?'已连接':'未连接');d.style.background=ok?'#4CAF50':'#E53935';};
+  const poll=async()=>{try{const r=await chrome.runtime.sendMessage({cmd:'ws_state'});render(!!(r&&r.connected));}catch(e){render(false);}};
+  poll();setInterval(poll,5000);
 })();
 
 new MutationObserver(muts => {
