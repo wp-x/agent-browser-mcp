@@ -185,10 +185,13 @@ class TMWebDriver:
         if session_id is None: session_id = self.default_session_id  
         if self.is_remote:
             print('remote_execute_js')
-            response = self._remote_cmd({"cmd": "execute_js", "sessionId": session_id, 
-                                         "code": code, "timeout": str(timeout)}).get('r', {})
-            if response.get('error'): raise Exception(response['error'])
-            return response
+            resp = self._remote_cmd({"cmd": "execute_js", "sessionId": session_id,
+                                     "code": code, "timeout": str(timeout)})
+            if resp is not None:
+                response = resp.get('r', {})
+                if response.get('error'): raise Exception(response['error'])
+                return response
+            # host died and this process took over: fall through to local execution
  
         session = self.sessions.get(session_id)
         if not session or not session.is_active(): 
@@ -243,13 +246,33 @@ class TMWebDriver:
         return rr
     
     def _remote_cmd(self, cmd):
-        return requests.post(self.remote, headers={"Content-Type": "application/json"}, json=cmd).json()
+        try:
+            return requests.post(self.remote, headers={"Content-Type": "application/json"},
+                                 json=cmd, timeout=float(cmd.get('timeout', 10)) + 20).json()
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            self._try_takeover()
+            if self.is_remote: raise
+            return None  # signals caller to retry via local path
 
-    def get_all_sessions(self):  
+    def _try_takeover(self):
+        if socket.socket().connect_ex((self.host, self.port + 1)) == 0: return
+        try:
+            self.start_ws_server()
+            self.start_http_server()
+        except OSError:
+            return  # lost the takeover race to another client, stay remote
+        self.is_remote = False
+        print("Bridge host died; this process took over as new host")
+        deadline = time.time() + 12  # extension probes the port every ~5s
+        while time.time() < deadline and not any(s.is_active() for s in self.sessions.values()):
+            time.sleep(0.5)
+
+    def get_all_sessions(self):
         if self.is_remote:
-            return self._remote_cmd({"cmd": "get_all_sessions"}).get('r', [])
+            resp = self._remote_cmd({"cmd": "get_all_sessions"})
+            if resp is not None: return resp.get('r', [])
         return [{'id': session.id, **session.info} for session in self.sessions.values()
-                if session.is_active()]  
+                if session.is_active()]
 
     def get_session_dict(self):
         return {session['id']: session['url'] for session in self.get_all_sessions()}
@@ -267,7 +290,8 @@ class TMWebDriver:
 
     def set_session(self, url_pattern: str) -> bool:  
         if self.is_remote:
-            matched = self._remote_cmd({"cmd": "find_session", "url_pattern": url_pattern}).get('r', [])
+            resp = self._remote_cmd({"cmd": "find_session", "url_pattern": url_pattern})
+            matched = resp.get('r', []) if resp is not None else self.find_session(url_pattern)
         else:
             matched = self.find_session(url_pattern)
         if not matched: return print(f"警告: 未找到URL包含 '{url_pattern}' 的会话")  
