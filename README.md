@@ -20,6 +20,7 @@
 ## 核心能力一览
 
 - 真实 Chrome 标签页发现与切换
+- Google Chrome / Google Chrome Dev 双浏览器路由
 - 页面扫描与简化内容提取
 - 页面内 JavaScript 执行
 - 原生 CDP 单命令 / 批量调用
@@ -223,6 +224,20 @@ chrome://extensions
 - `https://www.xiaohongshu.com`
 
 否则不会建立有效会话。
+
+## Google Chrome 与 Google Chrome Dev
+
+同一个 MCP 服务可以同时连接 Google Chrome 和 Google Chrome Dev：
+
+1. 在两个浏览器的 `chrome://extensions` 中加载同一个扩展目录。
+2. Google Chrome 无需额外设置，默认身份就是 `Google Chrome`。
+3. 在 Google Chrome Dev 中打开扩展弹窗，将“当前浏览器”改为 `Google Chrome Dev`。
+4. 两个浏览器都至少打开一个正常的 HTTP/HTTPS 页面。
+
+所有浏览器工具都接受可选的 `browser` 参数。未传参数时始终使用 Google Chrome；
+指定 `Google Chrome Dev`、`Chrome Dev`、`dev`、`开发版`或`开发浏览器`时使用开发浏览器。
+
+两个浏览器的标签页会话相互隔离，即使它们产生了相同的 Chrome `tabId` 也不会冲突。
 
 ## Hermes 配置
 

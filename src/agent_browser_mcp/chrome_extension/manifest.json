@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TMWD CDP Bridge",
-  "version": "2.0",
+  "version": "2.1.0",
   "description": "Cookie viewer + CDP bridge",
   "permissions": [
     "cookies",
@@ -11,7 +11,8 @@
     "scripting",
     "alarms",
     "declarativeNetRequest",
-    "management"
+    "management",
+    "storage"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {
