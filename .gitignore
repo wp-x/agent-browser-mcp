@@ -12,3 +12,4 @@ venv/
 .env
 .DS_Store
 src/agent_browser_mcp/chrome_extension/config.js
+src/agent_browser_mcp/temp_desktop.png
