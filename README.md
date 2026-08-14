@@ -186,8 +186,7 @@ agent-browser-mcp doctor
 
 这个命令会输出 JSON，帮助你检查：
 - 扩展目录位置
-- `config.js` 是否生成
-- 端口状态
+- WebSocket/HTTP 端口状态
 - 当前连接到的标签页数量
 - 下一步建议
 
@@ -284,9 +283,20 @@ hermes mcp test agent_browser
 - 对页面进行 CDP 截图
 - 在必要时执行真实鼠标/键盘操作
 
+## Upstream sync
+
+本版本从 GenericAgent 浏览器栈选择性同步了以下改进：
+- TMWebDriver HTTP Origin 防护、安全日志、幂等断连、明确的远程桥接超时/错误
+- 扩展通过 WebSocket 直接路由 JSON 命令，支持 `tabs.create`，并在页面角标实时展示连接状态
+- 简化 HTML 时，固定/绝对定位子节点不再错误扩大父节点的流式几何范围
+
+为保持独立 MCP 的最小权限与兼容性，本项目**有意未同步** GenericAgent 的 `contentSettings` 广泛权限，也不会修改 `navigator.webdriver`。扩展不再生成或依赖运行时 `config.js`；安装包内容保持只读。
+
 ## 安全提醒
 
-这个项目操作的是你的真实浏览器和真实桌面。
+这个项目操作的是你的真实浏览器和真实桌面。TMWebDriver 现在只允许绑定到解析结果全部为回环地址的主机（如 `localhost`、`127.0.0.1`、`::1`），并拒绝来自普通 HTTP(S) 网页 Origin 的 WebSocket/HTTP bridge 请求；Chrome 扩展 Origin 仍可连接。为兼容原有原生 WebSocket/HTTP 客户端，无 Origin 的本机连接仍被信任，因此同一用户账户下的本机进程仍可访问 bridge。导航工具仅接受无内嵌凭据的绝对 HTTP(S) URL。
+
+扩展不再全局移除页面 CSP（升级时会清理旧版动态规则 `9999`），而是保留 scripting 执行与必要时的 CDP fallback。扩展管理能力仅用于列出扩展，不再提供 reload/enable/disable 操作。
 
 这意味着：
 - 鼠标移动是真的

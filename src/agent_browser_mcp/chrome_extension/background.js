@@ -1,26 +1,39 @@
 // background.js - Cookie + CDP Bridge
 chrome.runtime.onInstalled.addListener(() => {
   console.log('CDP Bridge installed');
-  // Strip CSP headers to allow eval/inline scripts
-  chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [9999],
-    addRules: [{
-      id: 9999, priority: 1,
-      action: { type: 'modifyHeaders', responseHeaders: [
-        { header: 'content-security-policy', operation: 'remove' },
-        { header: 'content-security-policy-report-only', operation: 'remove' }
-      ]},
-      condition: { urlFilter: '*', resourceTypes: ['main_frame', 'sub_frame'] }
-    }]
-  });
+  // Clean up the CSP-stripping rule left by older extension versions.
+  if (chrome.declarativeNetRequest) {
+    chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [9999] }).catch(() => {});
+  }
 });
 
+function validateNavigationUrl(value) {
+  if (typeof value !== 'string' || /[\u0000-\u001f\u007f]/.test(value)) throw new Error('Invalid navigation URL');
+  let url;
+  try { url = new URL(value); } catch (_) { throw new Error('Navigation URL must be absolute'); }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+    throw new Error('Navigation URL must use http(s) without credentials');
+  }
+  return url.href;
+}
+
 async function handleExtMessage(msg, sender) {
+  if (msg.cmd === 'status') return { ok: true, data: status };
   if (msg.cmd === 'cookies') return await handleCookies(msg, sender);
   if (msg.cmd === 'cdp') return await handleCDP(msg, sender);
   if (msg.cmd === 'batch') return await handleBatch(msg, sender);
   if (msg.cmd === 'tabs') {
     try {
+      if (msg.method === 'create') {
+        const tab = await chrome.tabs.create({
+          url: validateNavigationUrl(msg.url),
+          active: msg.active !== undefined ? msg.active : false,
+          index: msg.index,
+          windowId: msg.windowId,
+          openerTabId: msg.openerTabId
+        });
+        return { ok: true, data: { id: tab.id, url: tab.url, title: tab.title } };
+      }
       if (msg.method === 'switch') {
         const tab = await chrome.tabs.update(msg.tabId, { active: true });
         await chrome.windows.update(tab.windowId, { focused: true });
@@ -34,23 +47,9 @@ async function handleExtMessage(msg, sender) {
   }
   if (msg.cmd === 'management') {
     try {
-      if (msg.method === 'list') {
-        const all = await chrome.management.getAll();
-        return { ok: true, data: all.map(e => ({ id: e.id, name: e.name, enabled: e.enabled, type: e.type, version: e.version })) };
-      }
-      if (msg.method === 'reload') {
-        chrome.alarms.create('tmwd-self-reload', { when: Date.now() + 200 });
-        return { ok: true };
-      }
-      if (msg.method === 'disable') {
-        await chrome.management.setEnabled(msg.extId, false);
-        return { ok: true };
-      }
-      if (msg.method === 'enable') {
-        await chrome.management.setEnabled(msg.extId, true);
-        return { ok: true };
-      }
-      return { ok: false, error: 'Unknown method: ' + msg.method };
+      if (msg.method !== 'list') return { ok: false, error: 'Unsupported management method' };
+      const all = await chrome.management.getAll();
+      return { ok: true, data: all.map(e => ({ id: e.id, name: e.name, enabled: e.enabled, type: e.type, version: e.version })) };
     } catch (e) { return { ok: false, error: e.message }; }
   }
   return { ok: false, error: 'Unknown cmd: ' + msg.cmd };
@@ -189,7 +188,15 @@ function buildCdpScript(code) {
 
 // --- WebSocket Client for TMWebDriver ---
 let ws = null;
+let status = 'connected';
 const WS_URL = 'ws://127.0.0.1:18765';
+function setStatus(next) {
+  if (next === status) return;
+  status = next;
+  chrome.tabs.query({}).then(tabs => tabs.forEach(tab =>
+    chrome.tabs.sendMessage(tab.id, { type: 'tmwd_status', data: next }).catch(() => {})
+  ));
+}
 
 function scheduleProbe() {
   // Use chrome.alarms to survive MV3 service worker suspension
@@ -213,10 +220,6 @@ async function isServerAlive() {
 }
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name === 'tmwd-self-reload') {
-    chrome.runtime.reload();
-    return;
-  }
   if (alarm.name === 'tmwd-ws-keepalive') {
     // Keepalive: ping to keep SW alive + detect dead connections
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -234,6 +237,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       console.log('[TMWD-WS] Server detected, connecting...');
       connectWS();
     } else {
+      setStatus('disconnected');
       scheduleProbe(); // Server not up, keep probing
     }
   }
@@ -317,6 +321,7 @@ function connectWS() {
   console.log('[TMWD-WS] Connecting to', WS_URL);
   try {
     ws = new WebSocket(WS_URL);
+    setStatus('connecting');
   } catch (e) {
     console.error('[TMWD-WS] Constructor error:', e);
     ws = null;
@@ -325,6 +330,7 @@ function connectWS() {
   }
   ws.onopen = async () => {
     console.log('[TMWD-WS] Connected!');
+    setStatus('connected');
     scheduleKeepalive(); // Keep SW alive while connected
     const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url));
     ws.send(JSON.stringify({
@@ -363,6 +369,7 @@ function connectWS() {
   };
   ws.onclose = () => {
     console.log('[TMWD-WS] Disconnected');
+    setStatus('connecting');
     ws = null;
     scheduleProbe();
   };

@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import random
 import sys
 import time
 from pathlib import Path
@@ -17,7 +16,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from .tmwebdriver import TMWebDriver  # noqa: E402
+from .tmwebdriver import TMWebDriver, validate_navigation_url  # noqa: E402
 from . import simphtml  # noqa: E402
 
 mcp = FastMCP(
@@ -37,19 +36,8 @@ def chrome_extension_dir() -> Path:
     return ROOT / "chrome_extension"
 
 
-def ensure_config_js() -> Path:
-    path = chrome_extension_dir() / "config.js"
-    if not path.exists():
-        path.write_text(
-            f"const TID = '__ljq_{hex(random.randint(0, 99999999))[2:8]}';",
-            encoding="utf-8",
-        )
-    return path
-
-
 def get_driver() -> TMWebDriver:
     global _driver
-    ensure_config_js()
     if _driver is None:
         _driver = TMWebDriver(host=_DRIVER_HOST, port=_DRIVER_PORT)
     return _driver
@@ -125,7 +113,7 @@ def get_setup_status() -> dict[str, Any]:
     return {
         "extension_name": "TMWD CDP Bridge",
         "extension_path": str(chrome_extension_dir()),
-        "config_js": str(ensure_config_js()),
+        "config_js": None,
         "tmwebdriver_host": _DRIVER_HOST,
         "tmwebdriver_ws_port": _DRIVER_PORT,
         "tmwebdriver_http_port": _DRIVER_PORT + 1,
@@ -158,6 +146,7 @@ def switch_tab(session_id: Optional[str] = None, url_pattern: Optional[str] = No
 
 @mcp.tool(description="Navigate the current tab to a URL using real-browser JS navigation.")
 def open_url(url: str, session_id: Optional[str] = None, timeout: float = 15.0) -> dict[str, Any]:
+    url = validate_navigation_url(url)
     if session_id is not None:
         switch_session(session_id=session_id)
     driver = require_driver()
@@ -171,16 +160,22 @@ def open_url(url: str, session_id: Optional[str] = None, timeout: float = 15.0) 
 
 @mcp.tool(description="Open a new browser tab with the given URL.")
 def open_new_tab(url: str) -> dict[str, Any]:
-    driver = require_driver()
-    result = driver.newtab(url)
-    return {"status": "ok", "result": result, "tabs": compact_tabs()}
+    url = validate_navigation_url(url)
+    result = require_driver().newtab(url)
+    tab = result.get("data") if isinstance(result, dict) else result
+    return {
+        "status": "ok",
+        "tab": tab,
+        "result": result,
+        "tabs": compact_tabs(),
+    }
 
 
 @mcp.tool(description="Get absolute path to the unpacked Chrome extension directory for manual installation.")
 def extension_path() -> dict[str, Any]:
     return {
         "extension_path": str(chrome_extension_dir()),
-        "config_js": str(ensure_config_js()),
+        "config_js": None,
     }
 
 
@@ -381,6 +376,5 @@ def pointer_info() -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    ensure_config_js()
     get_driver()
     mcp.run(transport="stdio")

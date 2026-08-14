@@ -6,13 +6,11 @@ import socket
 import sys
 from pathlib import Path
 
-from .server import ROOT, ensure_config_js, get_driver, chrome_extension_dir, mcp
+from .server import get_driver, chrome_extension_dir, mcp
 
 
 def cmd_extension_path() -> int:
-    path = chrome_extension_dir()
-    ensure_config_js()
-    print(path)
+    print(chrome_extension_dir())
     return 0
 
 
@@ -37,7 +35,6 @@ def _port_open(host: str, port: int) -> bool:
 
 
 def cmd_doctor() -> int:
-    ensure_config_js()
     driver = get_driver()
     ws_port = getattr(driver, "port", 18765)
     http_port = ws_port + 1
@@ -49,7 +46,7 @@ def cmd_doctor() -> int:
         err = str(e)
     payload = {
         "extension_path": str(chrome_extension_dir()),
-        "config_js": str((chrome_extension_dir() / 'config.js').resolve()),
+        "config_js": None,
         "remote_mode": getattr(driver, "is_remote", False),
         "tmwebdriver_host": getattr(driver, "host", "127.0.0.1"),
         "tmwebdriver_ws_port": ws_port,
@@ -92,7 +89,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "print-hermes-config":
         return cmd_print_hermes_config()
 
-    ensure_config_js()
     get_driver()
     mcp.run(transport="stdio")
     return 0

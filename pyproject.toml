@@ -22,7 +22,7 @@ classifiers = [
   "Topic :: Utilities"
 ]
 dependencies = [
-  "mcp",
+  "mcp>=1.27,<2",
   "requests",
   "beautifulsoup4",
   "bottle",

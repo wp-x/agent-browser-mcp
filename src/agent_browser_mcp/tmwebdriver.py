@@ -1,9 +1,62 @@
-import json, threading, time, uuid, queue, socket, requests, traceback
-from typing import Dict, Any, Optional, List  
-from simple_websocket_server import WebSocketServer, WebSocket  
-from bs4 import BeautifulSoup  
-import bottle, random
-from bottle import route, template, request, response
+import ipaddress
+import json, threading, time, uuid, queue, socket, traceback
+from typing import Any
+from urllib.parse import urlsplit
+
+import bottle
+import requests
+from bottle import request
+from simple_websocket_server import WebSocketServer, WebSocket
+
+def validate_navigation_url(url: str) -> str:
+    if not isinstance(url, str) or any(ord(char) < 32 or ord(char) == 127 for char in url):
+        raise ValueError("URL must be a string without control characters")
+    try:
+        parsed = urlsplit(url)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("URL is invalid") from exc
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or not parsed.hostname:
+        raise ValueError("URL must be an absolute http:// or https:// URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URL must not contain embedded credentials")
+    return url
+
+
+def is_allowed_websocket_origin(origin: str | None) -> bool:
+    """Only the extension may connect as a browser; originless legacy clients remain supported."""
+    if origin is None:
+        return True
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "chrome-extension"
+        and bool(parsed.netloc)
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path in ("", "/")
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def validate_loopback_host(host: str) -> None:
+    """Reject wildcard or remotely reachable bind hosts, including mixed DNS results."""
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(host, None)}
+    except socket.gaierror as exc:
+        raise ValueError(f"TMWebDriver host does not resolve: {host}") from exc
+    if not addresses or any(not ipaddress.ip_address(address).is_loopback for address in addresses):
+        raise ValueError(f"TMWebDriver host must resolve only to loopback addresses: {host}")
+
+
+def safe_print(*args, **kwargs):
+    try:
+        print(*args, **kwargs)
+    except Exception:
+        pass
 
 class Session:
     def __init__(self, session_id, info, client=None):
@@ -30,25 +83,40 @@ class Session:
         self.connect_at = time.time()
         self.disconnect_at = None
     def mark_disconnected(self):
-        print(f"Tab disconnected: {self.url} (Session: {self.id})")
-        self.disconnect_at = time.time()
+        if self.disconnect_at is None:
+            safe_print(f"Tab disconnected: {self.url} (Session: {self.id})")
+            self.disconnect_at = time.time()
 
 
 class TMWebDriver:  
-    def __init__(self, host: str = '127.0.0.1', port: int = 18765):  
+    def __init__(self, host: str = '127.0.0.1', port: int = 18765):
+        validate_loopback_host(host)
         self.host, self.port = host, port
         self.sessions, self.results, self.acks = {}, {}, {}
-        self.default_session_id = None  
-        self.latest_session_id = None  
-        self.is_remote = socket.socket().connect_ex((host, port+1)) == 0
+        self.default_session_id = None
+        self.latest_session_id = None
+        self.ext_ws_client = None
+        try:
+            probe = socket.create_connection((host, port + 1), timeout=0.25)
+        except OSError:
+            self.is_remote = False
+        else:
+            probe.close()
+            self.is_remote = True
         if not self.is_remote:  
             self.start_ws_server()  
             self.start_http_server()
         else:
-            self.remote = f'http://{self.host}:{self.port+1}/link'
+            remote_host = f"[{self.host}]" if ":" in self.host else self.host
+            self.remote = f'http://{remote_host}:{self.port+1}/link'
 
     def start_http_server(self):
         self.app = app = bottle.Bottle()
+
+        @app.hook('before_request')
+        def reject_web_origin():
+            if request.headers.get('Origin') is not None:
+                bottle.abort(403)
 
         @app.route('/api/longpoll', method=['GET', 'POST'])
         def long_poll():
@@ -57,7 +125,7 @@ class TMWebDriver:
             session_info = {'url': data.get('url'), 'title': data.get('title', ''), 'type': 'http'}  
             if session_id not in self.sessions: 
                 session = Session(session_id, session_info, queue.Queue())
-                print(f"Browser http connected: {session.url} (Session: {session_id})")  
+                safe_print(f"Browser http connected: {session.url} (Session: {session_id})")
                 self.sessions[session_id] = session
             session = self.sessions[session_id]
             if session.disconnect_at is not None and session.type != 'http': session.reconnect(queue.Queue(), session_info)
@@ -69,7 +137,7 @@ class TMWebDriver:
                 try:
                     msg = msgQ.get(timeout=0.2)
                     try: self.acks[json.loads(msg).get('id','')] = True
-                    except: traceback.print_exc()
+                    except (TypeError, ValueError): traceback.print_exc()
                     return msg
                 except queue.Empty: continue
             return json.dumps({"id": "", "ret": "next long-poll"})
@@ -96,7 +164,7 @@ class TMWebDriver:
                 timeout = float(data.get('timeout', 10.0))
                 try:
                     result = self.execute_js(code, timeout=timeout, session_id=session_id)
-                    print('[remote result]', (str(code)[:50] + ' RESULT:' +str(result)[:50]).replace('\n', ' '))
+                    safe_print('[remote result]', (str(code)[:50] + ' RESULT:' +str(result)[:50]).replace('\n', ' '))
                     return json.dumps({'r': result}, ensure_ascii=False)
                 except Exception as e:
                     return json.dumps({'r': {'error': str(e)}}, ensure_ascii=False)
@@ -121,8 +189,13 @@ class TMWebDriver:
     def start_ws_server(self) -> None:  
         driver = self  
         class JSExecutor(WebSocket):  
-            def handle(self) -> None:  
-                try:  
+            def handle(self) -> None:
+                if not getattr(self, 'origin_allowed', is_allowed_websocket_origin(
+                    self.request.headers.get('Origin') if self.request else None
+                )):
+                    self.close(1008, "WebSocket Origin not allowed")
+                    return
+                try:
                     data = json.loads(self.data)  
                     if data.get('type') == 'ready':  
                         session_id = data.get('sessionId')  
@@ -130,9 +203,13 @@ class TMWebDriver:
                             'connected_at': time.time(), 'type': 'ws'}  
                         driver._register_client(session_id, self, session_info)  
                     elif data.get('type') in ['ext_ready', 'tabs_update']:
+                        if data.get('type') == 'ext_ready':
+                            driver.ext_ws_client = self
+                        elif driver.ext_ws_client is not self:
+                            return
                         tabs = data.get('tabs', [])
                         current_tab_ids = {str(tab['id']) for tab in tabs}
-                        print(f"Received tabs update: {current_tab_ids}")
+                        safe_print(f"Received tabs update: {current_tab_ids}")
                         for sid in list(driver.sessions.keys()):
                             sess = driver.sessions[sid]
                             if sess.type == 'ext_ws' and sid not in current_tab_ids:
@@ -140,27 +217,33 @@ class TMWebDriver:
                         for tab in tabs:
                             session_id = str(tab['id'])
                             session_info = {'url': tab.get('url'), 'title': tab.get('title', ''), 'connected_at': time.time(), 'type': 'ext_ws'}
-                            sess = driver.sessions.get(session_id)
-                            if sess and sess.is_active(): sess.info = session_info
-                            else: driver._register_client(session_id, self, session_info)
+                            # Always rebind, even when the logical tab session is already active.
+                            driver._register_client(session_id, self, session_info)
                     elif data.get('type') == 'ack': driver.acks[data.get('id','')] = True
                     elif data.get('type') == 'result':  
                         driver.results[data.get('id')] = {'success': True, 'data': data.get('result'), 'newTabs': data.get('newTabs', [])}  
                     elif data.get('type') == 'error':  
                         driver.results[data.get('id')] = {'success': False, 'data': data.get('error'), 'newTabs': data.get('newTabs', [])}  
                 except Exception as e:  
-                    print(f"Error handling message: {e}")  
-                    if hasattr(self, 'data'): print(self.data)  
-            def connected(self): (f"New connection from {self.address}")  
-            def handle_close(self): 
-                print(f"WS Connection closed: {self.address}")
-                driver._unregister_client(self)  
+                    safe_print(f"Error handling message: {e}")
+                    if hasattr(self, 'data'): safe_print(self.data)
+            def connected(self):
+                origin = self.request.headers.get('Origin')
+                self.origin_allowed = is_allowed_websocket_origin(origin)
+                if not self.origin_allowed:
+                    safe_print(f"Rejected WebSocket Origin: {origin}")
+                    self.close(1008, "WebSocket Origin not allowed")
+            def handle_close(self):
+                safe_print(f"WS Connection closed: {self.address}")
+                driver._unregister_client(self)
+                if driver.ext_ws_client is self:
+                    driver.ext_ws_client = None
         
         self.server = WebSocketServer(self.host, self.port, JSExecutor)  
         server_thread = threading.Thread(target=self.server.serve_forever)  
         server_thread.daemon = True  
         server_thread.start()  
-        print(f"WebSocket server running on ws://{self.host}:{self.port}")  
+        safe_print(f"WebSocket server running on ws://{self.host}:{self.port}")
     
     def _register_client(self, session_id: str, client: WebSocket, session_info) -> None:  
         is_new_session = session_id not in self.sessions
@@ -168,11 +251,11 @@ class TMWebDriver:
         if is_new_session:
             session = Session(session_id, session_info, client)
             self.sessions[session_id] = session            
-            print(f"New tab connected: {session.url} (Session: {session_id})")  
+            safe_print(f"New tab connected: {session.url} (Session: {session_id})")
         else:
             session = self.sessions[session_id]
             session.reconnect(client, session_info)
-            print(f"Tab reconnected: {session.url} (Session: {session_id})")  
+            safe_print(f"Tab reconnected: {session.url} (Session: {session_id})")
 
         self.latest_session_id = session_id
         if self.default_session_id is None: self.default_session_id = session_id 
@@ -184,7 +267,7 @@ class TMWebDriver:
     def execute_js(self, code, timeout=15, session_id=None) -> Any:  
         if session_id is None: session_id = self.default_session_id  
         if self.is_remote:
-            print('remote_execute_js')
+            safe_print('remote_execute_js')
             response = self._remote_cmd({"cmd": "execute_js", "sessionId": session_id, 
                                          "code": code, "timeout": str(timeout)}).get('r', {})
             if response.get('error'): raise Exception(response['error'])
@@ -198,13 +281,14 @@ class TMWebDriver:
                 alive_sessions = [s for s in self.sessions.values() if s.is_active()]
                 if alive_sessions:
                     session = alive_sessions[0]  
-                    print(f"会话 {session_id} 未连接，自动切换到最新活动会话: {session.id}")
+                    safe_print(f"会话 {session_id} 未连接，自动切换到最新活动会话: {session.id}")
                     session_id = self.default_session_id = session.id
                 if not session or not session.is_active(): 
                     raise ValueError(f"会话ID {session_id} 未连接")  
 
         tp = session.type
-        assert tp in ['ws', 'http', 'ext_ws'], f"Unsupported session type: {tp}"
+        if tp not in ('ws', 'http', 'ext_ws'):
+            raise ValueError(f"Unsupported session type: {tp}")
         exec_id = str(uuid.uuid4())  
         payload_dict = {'id': exec_id, 'code': code}
         if tp == 'ext_ws': payload_dict['tabId'] = int(session.id)
@@ -243,7 +327,28 @@ class TMWebDriver:
         return rr
     
     def _remote_cmd(self, cmd):
-        return requests.post(self.remote, headers={"Content-Type": "application/json"}, json=cmd).json()
+        try:
+            response = requests.post(
+                self.remote,
+                headers={"Content-Type": "application/json"},
+                json=cmd,
+                timeout=30,
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.Timeout as exc:
+            raise TimeoutError(
+                f"Timed out after 30s contacting the standalone TMWebDriver bridge at {self.remote}"
+            ) from exc
+        except requests.exceptions.ConnectionError as exc:
+            raise ConnectionError(
+                f"Cannot connect to the standalone TMWebDriver bridge at {self.remote}; "
+                "start agent-browser-mcp or check AGENT_BROWSER_TMWD_HOST/PORT"
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            raise ConnectionError(f"Standalone TMWebDriver request failed: {exc}") from exc
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Standalone TMWebDriver returned an invalid JSON response") from exc
 
     def get_all_sessions(self):  
         if self.is_remote:
@@ -270,16 +375,18 @@ class TMWebDriver:
             matched = self._remote_cmd({"cmd": "find_session", "url_pattern": url_pattern}).get('r', [])
         else:
             matched = self.find_session(url_pattern)
-        if not matched: return print(f"警告: 未找到URL包含 '{url_pattern}' 的会话")  
-        if len(matched) > 1: print(f"警告: 找到多个URL包含 '{url_pattern}' 的会话，选择第一个")  
+        if not matched: return safe_print(f"警告: 未找到URL包含 '{url_pattern}' 的会话")
+        if len(matched) > 1: safe_print(f"警告: 找到多个URL包含 '{url_pattern}' 的会话，选择第一个")
         self.default_session_id, info = matched[0]
-        print(f"成功设置默认会话: {self.default_session_id}: {info['url']}")  
+        safe_print(f"成功设置默认会话: {self.default_session_id}: {info['url']}")
         return self.default_session_id  
     
-    def jump(self, url, timeout=10): self.execute_js(f"window.location.href='{url}'", timeout=timeout)
+    def jump(self, url, timeout=10):
+        self.execute_js(f"window.location.href={json.dumps(url)}", timeout=timeout)
     def newtab(self, url=None):
-        if url is None: url = "http://www.baidu.com/robots.txt"
-        return self.execute_js(f'GM_openInTab("{url}");')
+        if url is None:
+            url = "http://www.baidu.com/robots.txt"
+        return self.execute_js(json.dumps({"cmd": "tabs", "method": "create", "url": url}))
     
 if __name__ == "__main__":
     driver = TMWebDriver(host='127.0.0.1', port=18765)

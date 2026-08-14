@@ -11,4 +11,3 @@ src/*.egg-info/
 venv/
 .env
 .DS_Store
-src/agent_browser_mcp/chrome_extension/config.js
